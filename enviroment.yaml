@@ -1,0 +1,9 @@
+name: usdbuilds
+channels:
+  - defaults
+dependencies:
+  - openusd
+  - yaml
+  - pyyaml
+  - opencv
+prefix: /home/leona/.conda/envs/usdbuilds
