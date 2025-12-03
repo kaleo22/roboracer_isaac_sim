@@ -1,6 +1,7 @@
 name: usdbuilds
 channels:
   - defaults
+  - conda-forge
 dependencies:
   - openusd
   - yaml
