@@ -1,96 +1,20 @@
-#!/usr/bin/env python3
-
 import math
 from pathlib import Path
 
 import yaml
 import cv2
 import numpy as np
+import racetrack
+import boundariesinterpolation as bi
 
 from pxr import Usd, UsdGeom, Gf, Sdf
 # Wenn im Isaac-Umfeld:
 # from pxr import PhysxSchema
 
 # Konfiguration für die Barriers (Luftschläuche)
-BARRIER_HEIGHT = 0.4      # m
 BARRIER_DIAMETER = 0.3    # m (Breite der "Schläuche")
 SEGMENT_LENGTH_MIN = 0.2  # m, minimale Segmentlänge
-
-
-def load_map(yaml_path: Path):
-    with open(yaml_path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-
-    image_rel = cfg["image"]
-    resolution = float(cfg["resolution"])
-    origin = cfg.get("origin", [0.0, 0.0, 0.0])
-
-    img_path = (yaml_path.parent / image_rel).resolve()
-    img = cv2.imread(str(img_path), cv2.IMREAD_UNCHANGED)
-    if img is None:
-        raise FileNotFoundError(f"Konnte Bild nicht laden: {img_path}")
-
-    if img.ndim == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    return cfg, img, resolution, origin
-
-
-def extract_contours(img: np.ndarray, invert: bool = False):
-    # Binarisieren: anpassen je nach Map (schwarz = Wand, weiß = frei usw.)
-    _, thresh = cv2.threshold(
-        img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
-    if invert:
-        thresh = 255 - thresh
-
-    # Konturen der "Wände"
-    contours, _ = cv2.findContours(
-        thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    return contours
-
-
-def pixel_to_world(pt, img_shape, res, origin):
-    """pt: (x_px, y_px), img_shape: (h, w)"""
-    h, w = img_shape[:2]
-    col, row = pt
-
-    x = origin[0] + col * res
-    # Bild-Y nach oben invertieren:
-    y = origin[1] + (h - row) * res
-    z = 0.0
-    return Gf.Vec3f(x, y, z)
-
-
-def create_stage(usd_path: Path):
-    stage = Usd.Stage.CreateNew(str(usd_path))
-    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
-    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
-    world = UsdGeom.Xform.Define(stage, "/World")
-    return stage, world.GetPrim()
-
-
-def add_ground_plane(stage, parent_prim, img_shape, res, origin):
-    h, w = img_shape[:2]
-    width_m = w * res
-    height_m = h * res
-
-    ground = UsdGeom.Cube.Define(stage, Sdf.Path("/World/Ground"))
-    # Wir nehmen den Mittelpunkt der Map als Position
-    cx = origin[0] + width_m / 2.0
-    cy = origin[1] + height_m / 2.0
-    cz = -0.01  # etwas unter 0
-    ground.AddTranslateOp().Set(Gf.Vec3f(cx, cy, cz))
-    # Größe: X,Y = Kartenausdehnung, Z sehr dünn
-    ground.AddScaleOp().Set(Gf.Vec3f(width_m, height_m, 0.02))
-
-    # Hier könntest du ein PhysX Static Collider draus machen, falls nötig
-    # collision_api = PhysxSchema.PhysxCollisionAPI.Apply(ground.GetPrim())
-    # ...
-
-    return ground
+BARRIER_HEIGHT = 0.2      # m, Höhe der Barriers
 
 
 def add_barrier_segment(stage, parent_path: Sdf.Path,
@@ -133,41 +57,40 @@ def add_barrier_segment(stage, parent_path: Sdf.Path,
     return cube
 
 
-def add_barriers_from_contours(stage, img, contours, res, origin):
-    barriers_root = UsdGeom.Xform.Define(stage, "/World/Barriers")
-    root_path = barriers_root.GetPath()
-    img_shape = img.shape
-
-    seg_index = 0
-    for contour in contours:
-        # contour: Nx1x2 → flatten
-        pts = contour.reshape(-1, 2)
-
-        # jeden Punkt in Weltkoordinaten umrechnen
-        world_pts = [
-            pixel_to_world((int(x), int(y)), img_shape, res, origin)
-            for (x, y) in pts
-        ]
-
-        # Segmente entlang der Kontur erzeugen (Loop schließen)
-        for i in range(len(world_pts)):
-            p0 = world_pts[i]
-            p1 = world_pts[(i + 1) % len(world_pts)]  # Loop
-            added = add_barrier_segment(stage, root_path, p0, p1, seg_index)
-            if added is not None:
-                seg_index += 1
-
-
 def convert_map_to_usd(yaml_path: Path, usd_path: Path):
-    cfg, img, res, origin = load_map(yaml_path)
-    contours = extract_contours(img, invert=False)
+    _, img, res, origin = racetrack.load_map(yaml_path)
 
-    stage, world_prim = create_stage(usd_path)
-    add_ground_plane(stage, world_prim, img.shape, res, origin)
-    add_barriers_from_contours(stage, img, contours, res, origin)
+    #inner_cnt, outer_cnt = racetrack.extract_contours(img, invert=False)
+    inner_cnt, outer_cnt = bi.extract_two_track_edges(img)
+    print("Inner contour points:", len(inner_cnt))
+    print("Outer contour points:", len(outer_cnt))
+
+    stage, _ = racetrack.create_usd_stage(usd_path)
+    racetrack.add_ground_plane(stage, img.shape, res, origin)
+
+    # Innere Begrenzung
+    #inner_pts = racetrack.contour_to_world_points(inner_cnt, img.shape, res, origin)
+    #racetrack.create_basis_curve(stage, "/World/Track", "InnerBoundary", inner_pts)
+    inner_pts = bi.resample_polyline(racetrack.contour_to_world_points(inner_cnt, img.shape, res, origin), target_spacing=0.2)
+    bi.build_walls_from_polyline(stage, "/World/Track/InnerBarrier", "Inner", inner_pts, closed=True,
+                                half_width=0.15, height=0.25, segment_length=0.2)
+
+    # Äußere Begrenzung
+    outer_pts = bi.resample_polyline(racetrack.contour_to_world_points(outer_cnt, img.shape, res, origin), target_spacing=0.2)
+    bi.build_walls_from_polyline(stage, "/World/Track/OuterBarrier", "Outer", outer_pts, closed=True,
+                                half_width=0.15, height=0.25, segment_length=0.2)
+    #racetrack.create_basis_curve(stage, "/World/Track", "OuterBoundary", outer_pts)
+    # Barriers hinzufügen
+    # racetrack.build_barrier_segments(stage, "/World/Track/InnerBarrier", "Inner", inner_pts,
+    #                              segment_step=5, half_width=0.15, height=0.25)
+    # racetrack.build_barrier_segments(stage, "/World/Track/OuterBarrier", "Outer", outer_pts,
+    #                              segment_step=5, half_width=0.15, height=0.25)
+    print("=== STAGE PRIMS ===")
+    for prim in stage.Traverse():
+        print(prim.GetPath())
+    print("=== END ===")
 
     stage.GetRootLayer().Save()
-    print(f"USD gespeichert unter: {usd_path}")
 
 
 if __name__ == "__main__":
