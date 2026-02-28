@@ -6,3 +6,4 @@ env/
 __pycache__/
 .anaconda_backup/
 conda_env/
+.vscode/
